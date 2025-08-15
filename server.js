@@ -805,7 +805,7 @@ app.get('/api/stats/user', authenticateToken, (req, res) => {
     });
 });
 
-// Error handling middleware
+// Error handling middleware and need more error handing
 app.use((err, req, res, next) => {
     console.error(err.stack);
     res.status(500).json({ error: 'Something went wrong!' });
