@@ -22,7 +22,7 @@ Mine Master Server is a RESTful API backend for the Mine Master Minesweeper game
 
 1. **Clone the repository:**
    ```sh
-   git clone https://github.com/yourusername/mine-master-server.git
+   git clone https://github.com/manduulya/mine-master-server.git
    cd mine-master-server
    ```
 
