@@ -1,24 +1,58 @@
+// server.js
+const { createClient } = require('redis');
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const path = require('path');
 const passport = require('passport');
 const FacebookStrategy = require('passport-facebook').Strategy;
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const session = require('express-session');
+const RedisStore = require('connect-redis').default;
+const { knex: db, redis } = require('./db');
+
+
+const redisClient = createClient({
+    socket: {
+        host: 'redis', // Use the Docker service name
+        port: 6379
+    }
+});
+
+
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+
+async function initRedis() {
+    try {
+        await redisClient.connect();
+        console.log('Redis connected');
+
+        // Now it's safe to use Redis
+        await redisClient.ping();
+        console.log('Ping successful');
+    } catch (err) {
+        console.error('Redis connection failed:', err);
+    }
+}
+
+initRedis();
+
+
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'minemaster_secret_key_2024';
+if (!process.env.JWT_SECRET) {
+    console.warn('Warning: Using default JWT_SECRET. Set process.env.JWT_SECRET in production.');
+}
 
 // OAuth Configuration
 const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID || 'your_facebook_app_id';
 const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET || 'your_facebook_app_secret';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'your_google_client_id';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'your_google_client_secret';
-const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 // Middleware
 app.use(cors({
@@ -26,219 +60,171 @@ app.use(cors({
     credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
+
 app.use(session({
-    secret: 'minemaster_session_secret',
+    store: new RedisStore({
+        client: redis,
+        prefix: "myapp:"
+    }),
+    secret: process.env.SESSION_SECRET || 'your_session_secret',
     resave: false,
-    saveUninitialized: false
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    }
 }));
+
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Initialize SQLite Database
-const dbPath = path.join(__dirname, 'minemaster.db');
-const db = new sqlite3.Database(dbPath);
+// Simple startup checks (non-blocking)
+const MAX_RETRIES = 10;
+let retries = 0;
 
-// Create tables if they don't exist
-db.serialize(() => {
-    // Users table with OAuth support
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT,
-    country_flag TEXT DEFAULT 'international',
-    oauth_provider TEXT,
-    oauth_id TEXT,
-    profile_picture TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+async function connectToPostgres() {
+    while (retries < MAX_RETRIES) {
+        try {
+            await db.raw('SELECT 1'); // or your preferred connection test
+            console.log('Postgres connection OK');
+            break;
+        } catch (err) {
+            if (err.code === '57P03') {
+                console.log('Postgres is starting up, retrying...');
+                retries++;
+                await new Promise(res => setTimeout(res, 1000)); // wait 1 second
+            } else {
+                console.error('Postgres connection error', err);
+                break;
+            }
+        }
+    }
+}
+// db.raw('SELECT 1').then(() => console.log('Postgres connection OK')).catch(err => console.error('Postgres connection error', err));
+redis.ping().then(() => console.log('Redis connection OK')).catch(err => console.error('Redis connection error', err));
 
-    // Scores table (completed games only)
-    db.run(`CREATE TABLE IF NOT EXISTS scores (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    time_seconds INTEGER NOT NULL,
-    grid_width INTEGER NOT NULL,
-    grid_height INTEGER NOT NULL,
-    mine_count INTEGER NOT NULL,
-    won BOOLEAN NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-  )`);
-
-    // Game states table (for continuing games)
-    db.run(`CREATE TABLE IF NOT EXISTS game_states (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    grid_width INTEGER NOT NULL,
-    grid_height INTEGER NOT NULL,
-    mine_count INTEGER NOT NULL,
-    mine_positions TEXT NOT NULL,
-    revealed_cells TEXT NOT NULL,
-    flagged_cells TEXT NOT NULL,
-    game_status TEXT NOT NULL CHECK(game_status IN ('playing', 'won', 'lost')),
-    start_time INTEGER NOT NULL,
-    elapsed_time INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-  )`);
-
-    // Create indexes for better performance
-    db.run(`CREATE INDEX IF NOT EXISTS idx_scores_user_id ON scores (user_id)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_scores_time ON scores (time_seconds)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_scores_won ON scores (won)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_game_states_user_id ON game_states (user_id)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_users_oauth ON users (oauth_provider, oauth_id)`);
-
-    // Ensure only one active game per user
-    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_game_states_user_active ON game_states (user_id) WHERE game_status = 'playing'`);
-});
-
-// Passport configuration
+// Passport serialize/deserialize using Knex
 passport.serializeUser((user, done) => {
     done(null, user.id);
 });
 
 passport.deserializeUser((id, done) => {
-    db.get('SELECT * FROM users WHERE id = ?', [id], (err, user) => {
-        done(err, user);
-    });
+    db('users').where({ id }).first()
+        .then(user => done(null, user))
+        .catch(err => done(err));
 });
 
-// Facebook Strategy
+// Passport strategies
 passport.use(new FacebookStrategy({
     clientID: FACEBOOK_APP_ID,
     clientSecret: FACEBOOK_APP_SECRET,
     callbackURL: `${BASE_URL}/api/auth/facebook/callback`,
     profileFields: ['id', 'emails', 'name', 'picture']
-}, async (accessToken, refreshToken, profile, done) => {
+}, (accessToken, refreshToken, profile, done) => {
     try {
         const facebookId = profile.id;
         const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
-        const firstName = profile.name.givenName || '';
-        const lastName = profile.name.familyName || '';
-        const username = `${firstName}${lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '') || `facebook_user_${facebookId}`;
+        const firstName = (profile.name && profile.name.givenName) || '';
+        const lastName = (profile.name && profile.name.familyName) || '';
+        const usernameBase = `${firstName}${lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '') || `facebook_user_${facebookId}`;
         const profilePicture = profile.photos && profile.photos[0] ? profile.photos[0].value : null;
 
-        // Check if user already exists with this Facebook ID
-        db.get('SELECT * FROM users WHERE oauth_provider = ? AND oauth_id = ?', ['facebook', facebookId], (err, existingUser) => {
-            if (err) return done(err);
+        // Find user by oauth provider/id
+        db('users').where({ oauth_provider: 'facebook', oauth_id: facebookId }).first()
+            .then(existingUser => {
+                if (existingUser) return done(null, existingUser);
 
-            if (existingUser) {
-                return done(null, existingUser);
-            }
+                // If email exists, link account
+                if (email) {
+                    return db('users').where({ email }).first()
+                        .then(emailUser => {
+                            if (emailUser) {
+                                return db('users').where({ id: emailUser.id }).update({
+                                    oauth_provider: 'facebook',
+                                    oauth_id: facebookId,
+                                    // profile_picture: profilePicture,
+                                    updated_at: db.fn.now()
+                                }).then(() => {
+                                    return db('users').where({ id: emailUser.id }).first().then(u => done(null, u));
+                                });
+                            }
 
-            // Check if email already exists
-            if (email) {
-                db.get('SELECT * FROM users WHERE email = ?', [email], (err, emailUser) => {
-                    if (err) return done(err);
+                            // create new user with email
+                            return createOauthUser(usernameBase, email, 'facebook', facebookId, profilePicture, done);
+                        });
+                }
 
-                    if (emailUser) {
-                        // Link Facebook to existing account
-                        db.run('UPDATE users SET oauth_provider = ?, oauth_id = ?, profile_picture = ? WHERE id = ?',
-                            ['facebook', facebookId, profilePicture, emailUser.id], (err) => {
-                                if (err) return done(err);
-                                return done(null, { ...emailUser, oauth_provider: 'facebook', oauth_id: facebookId, profile_picture: profilePicture });
-                            });
-                    } else {
-                        // Create new user
-                        createOAuthUser(username, email, 'facebook', facebookId, profilePicture, done);
-                    }
-                });
-            } else {
-                // Create new user without email
-                createOAuthUser(username, `${username}@facebook.local`, 'facebook', facebookId, profilePicture, done);
-            }
-        });
-    } catch (error) {
-        done(error);
+                // create new user without verified email
+                return createOauthUser(usernameBase, `${usernameBase}@facebook.local`, 'facebook', facebookId, profilePicture, done);
+            })
+            .catch(err => done(err));
+    } catch (err) {
+        done(err);
     }
 }));
 
-// Google Strategy
 passport.use(new GoogleStrategy({
     clientID: GOOGLE_CLIENT_ID,
     clientSecret: GOOGLE_CLIENT_SECRET,
     callbackURL: `${BASE_URL}/api/auth/google/callback`
-}, async (accessToken, refreshToken, profile, done) => {
+}, (accessToken, refreshToken, profile, done) => {
     try {
         const googleId = profile.id;
         const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
-        const firstName = profile.name.givenName || '';
-        const lastName = profile.name.familyName || '';
-        const username = `${firstName}${lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '') || `google_user_${googleId}`;
+        const firstName = (profile.name && profile.name.givenName) || '';
+        const lastName = (profile.name && profile.name.familyName) || '';
+        const usernameBase = `${firstName}${lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '') || `google_user_${googleId}`;
         const profilePicture = profile.photos && profile.photos[0] ? profile.photos[0].value : null;
 
-        // Check if user already exists with this Google ID
-        db.get('SELECT * FROM users WHERE oauth_provider = ? AND oauth_id = ?', ['google', googleId], (err, existingUser) => {
-            if (err) return done(err);
+        db('users').where({ oauth_provider: 'google', oauth_id: googleId }).first()
+            .then(existingUser => {
+                if (existingUser) return done(null, existingUser);
 
-            if (existingUser) {
-                return done(null, existingUser);
-            }
+                if (email) {
+                    return db('users').where({ email }).first()
+                        .then(emailUser => {
+                            if (emailUser) {
+                                return db('users').where({ id: emailUser.id }).update({
+                                    oauth_provider: 'google',
+                                    oauth_id: googleId,
+                                    // profile_picture: profilePicture,
+                                    updated_at: db.fn.now()
+                                }).then(() => db('users').where({ id: emailUser.id }).first().then(u => done(null, u)));
+                            }
 
-            // Check if email already exists
-            if (email) {
-                db.get('SELECT * FROM users WHERE email = ?', [email], (err, emailUser) => {
-                    if (err) return done(err);
+                            return createOauthUser(usernameBase, email, 'google', googleId, profilePicture, done);
+                        });
+                }
 
-                    if (emailUser) {
-                        // Link Google to existing account
-                        db.run('UPDATE users SET oauth_provider = ?, oauth_id = ?, profile_picture = ? WHERE id = ?',
-                            ['google', googleId, profilePicture, emailUser.id], (err) => {
-                                if (err) return done(err);
-                                return done(null, { ...emailUser, oauth_provider: 'google', oauth_id: googleId, profile_picture: profilePicture });
-                            });
-                    } else {
-                        // Create new user
-                        createOAuthUser(username, email, 'google', googleId, profilePicture, done);
-                    }
-                });
-            } else {
-                // Create new user without email
-                createOAuthUser(username, `${username}@google.local`, 'google', googleId, profilePicture, done);
-            }
-        });
-    } catch (error) {
-        done(error);
+                return createOauthUser(usernameBase, `${usernameBase}@google.local`, 'google', googleId, profilePicture, done);
+            })
+            .catch(err => done(err));
+    } catch (err) {
+        done(err);
     }
 }));
 
-// Helper function to create OAuth user
-function createOAuthUser(username, email, provider, oauthId, profilePicture, done) {
-    // Ensure username is unique
-    const checkUsername = (baseUsername, attempt = 0) => {
-        const testUsername = attempt === 0 ? baseUsername : `${baseUsername}${attempt}`;
+// Helper to create OAuth users (ensures unique username)
+function createOauthUser(usernameBase, email, provider, oauthId, profilePicture, done) {
+    function tryUsername(candidate, attempt = 0) {
+        const testName = attempt === 0 ? candidate : `${candidate}${attempt}`;
+        return db('users').where({ username: testName }).first()
+            .then(existing => {
+                if (existing) return tryUsername(candidate, attempt + 1);
+                return db('users').insert({
+                    username: testName,
+                    email,
+                    oauth_provider: provider,
+                    oauth_id: oauthId,
+                    // profile_picture: profilePicture,
+                    country_flag: 'international',
+                    created_at: db.fn.now(),
+                    updated_at: db.fn.now()
+                }).returning('id').then(rows => ({ game_id: rows[0].id || rows[0] }))
+            });
+    }
 
-        db.get('SELECT * FROM users WHERE username = ?', [testUsername], (err, existingUser) => {
-            if (err) return done(err);
-
-            if (existingUser) {
-                checkUsername(baseUsername, attempt + 1);
-            } else {
-                // Create user
-                db.run('INSERT INTO users (username, email, oauth_provider, oauth_id, profile_picture) VALUES (?, ?, ?, ?, ?)',
-                    [testUsername, email, provider, oauthId, profilePicture], function (err) {
-                        if (err) return done(err);
-
-                        const newUser = {
-                            id: this.lastID,
-                            username: testUsername,
-                            email,
-                            oauth_provider: provider,
-                            oauth_id: oauthId,
-                            profile_picture: profilePicture,
-                            country_flag: 'international'
-                        };
-                        done(null, newUser);
-                    });
-            }
-        });
-    };
-
-    checkUsername(username);
+    return tryUsername(usernameBase);
 }
 
 // JWT Authentication middleware
@@ -246,20 +232,16 @@ const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
-    if (!token) {
-        return res.status(401).json({ error: 'Access token required' });
-    }
+    if (!token) return res.status(401).json({ error: 'Access token required' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ error: 'Invalid token' });
-        }
+        if (err) return res.status(403).json({ error: 'Invalid token' });
         req.user = user;
         next();
     });
 };
 
-// Available country flags (ISO 3166-1 alpha-2 codes)
+// Available country flags
 const AVAILABLE_FLAGS = [
     'international', 'us', 'uk', 'ca', 'au', 'de', 'fr', 'it', 'es', 'jp',
     'kr', 'cn', 'in', 'br', 'mx', 'ru', 'za', 'eg', 'ng', 'ar', 'cl', 'pe',
@@ -267,569 +249,426 @@ const AVAILABLE_FLAGS = [
     'hu', 'gr', 'tr', 'il', 'ae', 'sa', 'th', 'vn', 'id', 'my', 'sg', 'ph'
 ];
 
-// Routes
+// --- Routes ---
 
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', message: 'Mine Master API is running' });
-});
+// Health
+app.get('/health', (req, res) => res.json({ status: 'OK', message: 'Mine Master API is running' }));
 
-// Debug endpoint - remove in production
-app.get('/api/debug/tables', (req, res) => {
-    const results = {};
-
-    db.all('SELECT * FROM users', [], (err, users) => {
-        if (err) return res.status(500).json({ error: err.message });
-        results.users = users;
-
-        db.all('SELECT * FROM scores', [], (err, scores) => {
-            if (err) return res.status(500).json({ error: err.message });
+// Debug: only enabled when DEBUG=true
+if (process.env.DEBUG === 'true') {
+    app.get('/api/debug/tables', (req, res) => {
+        const results = {};
+        db.select('*').from('users').limit(500).then(users => {
+            results.users = users;
+            return db.select('*').from('scores').limit(500);
+        }).then(scores => {
             results.scores = scores;
+            return db.select('*').from('game_states').limit(500);
+        }).then(game_states => {
+            results.game_states = game_states;
+            res.json(results);
+        }).catch(err => res.status(500).json({ error: err.message }));
+    });
+}
 
-            db.all('SELECT * FROM game_states', [], (err, gameStates) => {
-                if (err) return res.status(500).json({ error: err.message });
-                results.game_states = gameStates;
+// Flags
+app.get('/api/flags', (req, res) => res.json({ flags: AVAILABLE_FLAGS }));
 
-                res.json(results);
-            });
+// Register
+app.post('/api/auth/register', (req, res) => {
+    const { username, email, password, country_flag = 'international' } = req.body;
+
+    if (!username || !email || !password) return res.status(400).json({ error: 'Username, email, and password are required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    if (!AVAILABLE_FLAGS.includes(country_flag)) return res.status(400).json({ error: 'Invalid country flag' });
+
+    bcrypt.hash(password, 10).then(passwordHash => {
+        return db('users').insert({
+            username,
+            email,
+            password_hash: passwordHash,
+            country_flag,
+            created_at: db.fn.now(),
+            updated_at: db.fn.now()
+        }).returning(['id', 'username', 'email']);
+    }).then(rows => {
+        const user = rows[0];
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
+        res.status(201).json({
+            message: 'User created successfully',
+            user: { id: user.id, username: user.username, email: user.email, country_flag, auth_method: 'traditional' },
+            token
         });
+    }).catch(err => {
+        if (err && err.constraint && (err.constraint.includes('users_username_unique') || err.constraint.includes('users_email_unique'))) {
+            return res.status(409).json({ error: 'Username or email already exists' });
+        }
+        console.error(err);
+        res.status(500).json({ error: 'Failed to create user' });
     });
 });
 
-// Get available country flags
-app.get('/api/flags', (req, res) => {
-    res.json({ flags: AVAILABLE_FLAGS });
-});
+// Login
+app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
 
-// User Registration (Traditional)
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { username, email, password, country_flag = 'international' } = req.body;
+    db('users').where({ username }).andWhere('oauth_provider', null).first()
+        .then(user => {
+            if (!user || !user.password_hash) return res.status(401).json({ error: 'Invalid credentials' });
 
-        if (!username || !email || !password) {
-            return res.status(400).json({ error: 'Username, email, and password are required' });
-        }
-
-        if (password.length < 6) {
-            return res.status(400).json({ error: 'Password must be at least 6 characters long' });
-        }
-
-        if (!AVAILABLE_FLAGS.includes(country_flag)) {
-            return res.status(400).json({ error: 'Invalid country flag' });
-        }
-
-        const passwordHash = await bcrypt.hash(password, 10);
-
-        db.run(
-            'INSERT INTO users (username, email, password_hash, country_flag) VALUES (?, ?, ?, ?)',
-            [username, email, passwordHash, country_flag],
-            function (err) {
-                if (err) {
-                    if (err.message.includes('UNIQUE constraint failed')) {
-                        return res.status(409).json({ error: 'Username or email already exists' });
-                    }
-                    return res.status(500).json({ error: 'Failed to create user' });
-                }
-
-                const token = jwt.sign({ id: this.lastID, username }, JWT_SECRET, { expiresIn: '24h' });
-                res.status(201).json({
-                    message: 'User created successfully',
-                    user: {
-                        id: this.lastID,
-                        username,
-                        email,
-                        country_flag,
-                        auth_method: 'traditional'
-                    },
-                    token
-                });
-            }
-        );
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// User Login (Traditional)
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { username, password } = req.body;
-
-        if (!username || !password) {
-            return res.status(400).json({ error: 'Username and password are required' });
-        }
-
-        db.get(
-            'SELECT * FROM users WHERE username = ? AND oauth_provider IS NULL',
-            [username],
-            async (err, user) => {
-                if (err) {
-                    return res.status(500).json({ error: 'Server error' });
-                }
-
-                if (!user || !user.password_hash || !await bcrypt.compare(password, user.password_hash)) {
-                    return res.status(401).json({ error: 'Invalid credentials' });
-                }
-
+            return bcrypt.compare(password, user.password_hash).then(ok => {
+                if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
                 const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
                 res.json({
                     message: 'Login successful',
-                    user: {
-                        id: user.id,
-                        username: user.username,
-                        email: user.email,
-                        country_flag: user.country_flag,
-                        profile_picture: user.profile_picture,
-                        auth_method: 'traditional'
-                    },
+                    user: { id: user.id, username: user.username, email: user.email, country_flag: user.country_flag, auth_method: 'traditional' },
                     token
                 });
-            }
-        );
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
+            });
+        }).catch(err => {
+            console.error(err);
+            res.status(500).json({ error: 'Server error' });
+        });
 });
 
-// Facebook OAuth Routes
-app.get('/api/auth/facebook',
-    passport.authenticate('facebook', { scope: ['email'] })
-);
-
+// OAuth routes
+app.get('/api/auth/facebook', passport.authenticate('facebook', { scope: ['email'] }));
 app.get('/api/auth/facebook/callback',
     passport.authenticate('facebook', { failureRedirect: '/login' }),
     (req, res) => {
-        // Generate JWT token
         const token = jwt.sign({ id: req.user.id, username: req.user.username }, JWT_SECRET, { expiresIn: '24h' });
-
-        // Redirect to your Flutter app with token
         res.redirect(`myapp://auth/success?token=${token}&user=${encodeURIComponent(JSON.stringify({
-            id: req.user.id,
-            username: req.user.username,
-            email: req.user.email,
-            country_flag: req.user.country_flag,
-            profile_picture: req.user.profile_picture,
-            auth_method: 'facebook'
+            id: req.user.id, username: req.user.username, email: req.user.email, country_flag: req.user.country_flag, auth_method: 'facebook'
         }))}`);
     }
 );
 
-// Google OAuth Routes
-app.get('/api/auth/google',
-    passport.authenticate('google', { scope: ['profile', 'email'] })
-);
-
+app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 app.get('/api/auth/google/callback',
     passport.authenticate('google', { failureRedirect: '/login' }),
     (req, res) => {
-        // Generate JWT token
         const token = jwt.sign({ id: req.user.id, username: req.user.username }, JWT_SECRET, { expiresIn: '24h' });
-
-        // Redirect to your Flutter app with token
         res.redirect(`myapp://auth/success?token=${token}&user=${encodeURIComponent(JSON.stringify({
-            id: req.user.id,
-            username: req.user.username,
-            email: req.user.email,
-            country_flag: req.user.country_flag,
-            profile_picture: req.user.profile_picture,
-            auth_method: 'google'
+            id: req.user.id, username: req.user.username, email: req.user.email, country_flag: req.user.country_flag, auth_method: 'google'
         }))}`);
     }
 );
 
-// OAuth Status Check (for mobile apps)
+// OAuth Status check
 app.get('/api/auth/oauth/status/:provider', (req, res) => {
     const { provider } = req.params;
     const { oauth_id } = req.query;
+    if (!oauth_id) return res.status(400).json({ error: 'OAuth ID required' });
 
-    if (!oauth_id) {
-        return res.status(400).json({ error: 'OAuth ID required' });
-    }
-
-    db.get('SELECT * FROM users WHERE oauth_provider = ? AND oauth_id = ?', [provider, oauth_id], (err, user) => {
-        if (err) {
-            return res.status(500).json({ error: 'Server error' });
-        }
-
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
-        res.json({
-            message: 'OAuth login successful',
-            user: {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                country_flag: user.country_flag,
-                profile_picture: user.profile_picture,
-                auth_method: provider
-            },
-            token
-        });
-    });
-});
-
-// Get User Profile
-app.get('/api/user/profile', authenticateToken, (req, res) => {
-    db.get(
-        'SELECT id, username, email, country_flag, oauth_provider, profile_picture, created_at FROM users WHERE id = ?',
-        [req.user.id],
-        (err, user) => {
-            if (err) {
-                return res.status(500).json({ error: 'Server error' });
-            }
-            if (!user) {
-                return res.status(404).json({ error: 'User not found' });
-            }
+    db('users').where({ oauth_provider: provider, oauth_id }).first()
+        .then(user => {
+            if (!user) return res.status(404).json({ error: 'User not found' });
+            const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
             res.json({
-                ...user,
-                auth_method: user.oauth_provider || 'traditional'
+                message: 'OAuth login successful',
+                user: { id: user.id, username: user.username, email: user.email, country_flag: user.country_flag, auth_method: provider },
+                token
             });
-        }
-    );
+        }).catch(err => res.status(500).json({ error: 'Server error' }));
 });
 
-// Update User Profile
+// Profile
+app.get('/api/user/profile', authenticateToken, (req, res) => {
+    db('users').where({ id: req.user.id }).select('id', 'username', 'email', 'country_flag', 'oauth_provider', 'created_at').first()
+        .then(user => {
+            if (!user) return res.status(404).json({ error: 'User not found' });
+            res.json({ ...user, auth_method: user.oauth_provider || 'traditional' });
+        }).catch(err => res.status(500).json({ error: 'Server error' }));
+});
+
 app.put('/api/user/profile', authenticateToken, (req, res) => {
     const { country_flag } = req.body;
+    if (country_flag && !AVAILABLE_FLAGS.includes(country_flag)) return res.status(400).json({ error: 'Invalid country flag' });
 
-    if (country_flag && !AVAILABLE_FLAGS.includes(country_flag)) {
-        return res.status(400).json({ error: 'Invalid country flag' });
-    }
+    const updates = {};
+    if (country_flag !== undefined) updates.country_flag = country_flag;
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
 
-    const updates = [];
-    const params = [];
+    updates.updated_at = db.fn.now();
 
-    if (country_flag !== undefined) {
-        updates.push('country_flag = ?');
-        params.push(country_flag);
-    }
-
-    if (updates.length === 0) {
-        return res.status(400).json({ error: 'No valid fields to update' });
-    }
-
-    updates.push('updated_at = CURRENT_TIMESTAMP');
-    params.push(req.user.id);
-
-    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
-
-    db.run(query, params, function (err) {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to update profile' });
-        }
-
-        res.json({ message: 'Profile updated successfully' });
-    });
+    db('users').where({ id: req.user.id }).update(updates)
+        .then(() => res.json({ message: 'Profile updated successfully' }))
+        .catch(err => res.status(500).json({ error: 'Failed to update profile' }));
 });
 
-// Start New Game
+// Start new game
 app.post('/api/game/start', authenticateToken, (req, res) => {
-    try {
-        const { grid_width, grid_height, mine_count, mine_positions } = req.body;
+    const { mine_count, mine_positions, level_id } = req.body;
 
-        if (!grid_width || !grid_height || mine_count === undefined || !mine_positions) {
-            return res.status(400).json({ error: 'Grid dimensions, mine count, and mine positions are required' });
-        }
-
-        if (mine_positions.length !== mine_count) {
-            return res.status(400).json({ error: 'Mine positions count must match mine_count' });
-        }
-
-        // Delete any existing active game for this user
-        db.run('DELETE FROM game_states WHERE user_id = ? AND game_status = ?', [req.user.id, 'playing'], (err) => {
-            if (err) {
-                return res.status(500).json({ error: 'Failed to clear previous game' });
-            }
-
-            // Create new game state
-            const startTime = Date.now();
-            db.run(
-                `INSERT INTO game_states (user_id, grid_width, grid_height, mine_count, mine_positions, 
-         revealed_cells, flagged_cells, game_status, start_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [req.user.id, grid_width, grid_height, mine_count, JSON.stringify(mine_positions),
-                JSON.stringify([]), JSON.stringify([]), 'playing', startTime],
-                function (err) {
-                    if (err) {
-                        return res.status(500).json({ error: 'Failed to create new game' });
-                    }
-
-                    res.status(201).json({
-                        message: 'New game started',
-                        game_id: this.lastID,
-                        start_time: startTime
-                    });
-                }
-            );
-        });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+    if (mine_count === undefined || !Array.isArray(mine_positions)) {
+        return res.status(400).json({ error: 'Grid dimensions, mine count, and mine positions are required' });
     }
-});
+    if (mine_positions.length !== mine_count) {
+        return res.status(400).json({ error: 'Mine positions count must match mine_count' });
+    }
 
-// Get Current Game State
-app.get('/api/game/current', authenticateToken, (req, res) => {
-    db.get(
-        'SELECT * FROM game_states WHERE user_id = ? AND game_status = ?',
-        [req.user.id, 'playing'],
-        (err, game) => {
-            if (err) {
-                return res.status(500).json({ error: 'Server error' });
-            }
+    // Remove any existing active game for this user
+    db('game_states').where({ user_id: req.user.id, game_status: 'playing' }).del()
+        .then(() => {
+            return db('game_states')
+                .insert({
+                    user_id: req.user.id,
+                    mine_count,
+                    level_id,
+                    mine_positions: JSON.stringify(mine_positions),
+                    revealed_cells: JSON.stringify([]),
+                    flagged_cells: JSON.stringify([]),
+                    game_status: 'playing',
+                    created_at: db.fn.now(),
+                    updated_at: db.fn.now()
+                })
+                .returning('id');
+        })
+        .then(rows => {
+            // rows[0] could be { id: 3 } (Postgres) or just 3 (SQLite)
+            const row = rows[0];
+            const gameId = typeof row === 'object' ? row.id : row;
 
-            if (!game) {
-                return res.json({ game: null });
-            }
+            console.log("DEBUG: inserted rows =>", rows, "resolved gameId =>", gameId);
 
-            res.json({
-                game: {
-                    id: game.id,
-                    grid_width: game.grid_width,
-                    grid_height: game.grid_height,
-                    mine_count: game.mine_count,
-                    mine_positions: JSON.parse(game.mine_positions),
-                    revealed_cells: JSON.parse(game.revealed_cells),
-                    flagged_cells: JSON.parse(game.flagged_cells),
-                    game_status: game.game_status,
-                    start_time: game.start_time,
-                    elapsed_time: game.elapsed_time
-                }
+            res.status(201).json({
+                message: 'New game started',
+                game_id: gameId,
+                start_time: Date.now()
             });
-        }
-    );
+        })
+        .catch(err => {
+            console.error("ERROR inserting game state:", err);
+            res.status(500).json({ error: 'Failed to create new game' });
+        });
 });
 
-// Update Game State
-app.put('/api/game/update', authenticateToken, (req, res) => {
+// Get the active game for this user
+app.get('/api/game/active', authenticateToken, (req, res) => {
+    db('game_states')
+        .where({ user_id: req.user.id, game_status: 'playing' })
+        .first()
+        .then(game => {
+            if (!game) return res.status(404).json({ error: 'No active game' });
+
+            // Parse JSON fields before sending
+            game.mine_positions = JSON.parse(game.mine_positions);
+            game.revealed_cells = JSON.parse(game.revealed_cells);
+            game.flagged_cells = JSON.parse(game.flagged_cells);
+
+            res.json(game);
+        })
+        .catch(err => res.status(500).json({ error: 'Failed to fetch active game' }));
+});
+
+// Get current game
+app.get('/api/game/current', authenticateToken, async (req, res) => {
     try {
-        const { revealed_cells, flagged_cells, elapsed_time } = req.body;
+        const game = await db('game_states')
+            .where({ user_id: req.user.id })
+            .orderBy('updated_at', 'desc')
+            .first();
 
-        if (!revealed_cells || !flagged_cells || elapsed_time === undefined) {
-            return res.status(400).json({ error: 'Revealed cells, flagged cells, and elapsed time are required' });
+        if (!game) {
+            return res.status(404).json({ error: 'No active game found' });
         }
-
-        db.run(
-            `UPDATE game_states SET revealed_cells = ?, flagged_cells = ?, elapsed_time = ?, updated_at = CURRENT_TIMESTAMP 
-       WHERE user_id = ? AND game_status = ?`,
-            [JSON.stringify(revealed_cells), JSON.stringify(flagged_cells), elapsed_time, req.user.id, 'playing'],
-            function (err) {
-                if (err) {
-                    return res.status(500).json({ error: 'Failed to update game state' });
-                }
-
-                if (this.changes === 0) {
-                    return res.status(404).json({ error: 'No active game found' });
-                }
-
-                res.json({ message: 'Game state updated successfully' });
-            }
-        );
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Finish Game (Win or Loss)
-app.post('/api/game/finish', authenticateToken, (req, res) => {
-    try {
-        const { won, final_time } = req.body;
-
-        if (won === undefined || final_time === undefined) {
-            return res.status(400).json({ error: 'Won status and final time are required' });
-        }
-
-        // Get current game
-        db.get(
-            'SELECT * FROM game_states WHERE user_id = ? AND game_status = ?',
-            [req.user.id, 'playing'],
-            (err, game) => {
-                if (err) {
-                    return res.status(500).json({ error: 'Server error' });
-                }
-
-                if (!game) {
-                    return res.status(404).json({ error: 'No active game found' });
-                }
-
-                // Start transaction
-                db.serialize(() => {
-                    db.run('BEGIN TRANSACTION');
-
-                    // Update game state to finished
-                    const newStatus = won ? 'won' : 'lost';
-                    db.run(
-                        'UPDATE game_states SET game_status = ?, elapsed_time = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                        [newStatus, final_time, game.id],
-                        function (err) {
-                            if (err) {
-                                db.run('ROLLBACK');
-                                return res.status(500).json({ error: 'Failed to update game state' });
-                            }
-
-                            // Save score to scores table
-                            db.run(
-                                'INSERT INTO scores (user_id, time_seconds, grid_width, grid_height, mine_count, won) VALUES (?, ?, ?, ?, ?, ?)',
-                                [req.user.id, Math.floor(final_time / 1000), game.grid_width, game.grid_height, game.mine_count, won],
-                                function (err) {
-                                    if (err) {
-                                        db.run('ROLLBACK');
-                                        return res.status(500).json({ error: 'Failed to save score' });
-                                    }
-
-                                    db.run('COMMIT');
-                                    res.json({
-                                        message: 'Game finished successfully',
-                                        score_id: this.lastID,
-                                        won,
-                                        time_seconds: Math.floor(final_time / 1000)
-                                    });
-                                }
-                            );
-                        }
-                    );
-                });
-            }
-        );
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Get User's Scores
-app.get('/api/scores/user', authenticateToken, (req, res) => {
-    const { limit = 50, offset = 0 } = req.query;
-
-    const query = `
-    SELECT id, time_seconds, grid_width, grid_height, mine_count, won, created_at 
-    FROM scores 
-    WHERE user_id = ?
-    ORDER BY created_at DESC 
-    LIMIT ? OFFSET ?
-  `;
-
-    db.all(query, [req.user.id, parseInt(limit), parseInt(offset)], (err, scores) => {
-        if (err) {
-            return res.status(500).json({ error: 'Server error' });
-        }
-        res.json(scores);
-    });
-});
-
-// Get User's Best Scores
-app.get('/api/scores/user/best', authenticateToken, (req, res) => {
-    const query = `
-    SELECT 
-      grid_width,
-      grid_height,
-      mine_count,
-      MIN(time_seconds) as best_time,
-      COUNT(*) as games_played,
-      SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) as games_won
-    FROM scores 
-    WHERE user_id = ?
-    GROUP BY grid_width, grid_height, mine_count
-    ORDER BY mine_count ASC, grid_width ASC, grid_height ASC
-  `;
-
-    db.all(query, [req.user.id], (err, bestScores) => {
-        if (err) {
-            return res.status(500).json({ error: 'Server error' });
-        }
-
-        const scoresWithPercentage = bestScores.map(score => ({
-            ...score,
-            win_percentage: score.games_played > 0 ? Math.round((score.games_won / score.games_played) * 100) : 0
-        }));
-
-        res.json(scoresWithPercentage);
-    });
-});
-
-// Get Global Leaderboard
-app.get('/api/leaderboard', (req, res) => {
-    const { grid_width, grid_height, mine_count, limit = 10 } = req.query;
-
-    let query = `
-    SELECT u.username, u.country_flag, s.time_seconds, s.grid_width, s.grid_height, s.mine_count, s.created_at
-    FROM scores s
-    JOIN users u ON s.user_id = u.id
-    WHERE s.won = 1
-  `;
-
-    const params = [];
-
-    if (grid_width && grid_height && mine_count) {
-        query += ' AND s.grid_width = ? AND s.grid_height = ? AND s.mine_count = ?';
-        params.push(parseInt(grid_width), parseInt(grid_height), parseInt(mine_count));
-    }
-
-    query += ' ORDER BY s.time_seconds ASC LIMIT ?';
-    params.push(parseInt(limit));
-
-    db.all(query, params, (err, leaderboard) => {
-        if (err) {
-            return res.status(500).json({ error: 'Server error' });
-        }
-        res.json(leaderboard);
-    });
-});
-
-// Get User Statistics
-app.get('/api/stats/user', authenticateToken, (req, res) => {
-    const statsQuery = `
-    SELECT 
-      COUNT(*) as total_games,
-      SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) as games_won,
-      ROUND(AVG(CASE WHEN won = 1 THEN time_seconds END), 2) as avg_win_time,
-      MIN(CASE WHEN won = 1 THEN time_seconds END) as best_time,
-      MAX(CASE WHEN won = 1 THEN time_seconds END) as worst_win_time,
-      AVG(grid_width * grid_height) as avg_grid_size,
-      AVG(mine_count) as avg_mine_count
-    FROM scores 
-    WHERE user_id = ?
-  `;
-
-    db.get(statsQuery, [req.user.id], (err, stats) => {
-        if (err) {
-            return res.status(500).json({ error: 'Server error' });
-        }
-
-        const winPercentage = stats.total_games > 0 ? Math.round((stats.games_won / stats.total_games) * 100) : 0;
+        // Debug logging
+        console.log('Found game:', game);
+        console.log('level_id value:', game.level_id);
+        console.log('level_id type:', typeof game.level_id);
 
         res.json({
-            ...stats,
-            win_percentage: winPercentage
+            game_id: game.id,
+            level: game.level_id,
+            mine_count: game.mine_count,
+            mine_positions: JSON.parse(game.mine_positions),
+            revealed_cells: JSON.parse(game.revealed_cells),
+            flagged_cells: JSON.parse(game.flagged_cells),
+            game_status: game.game_status,
         });
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to load game state' });
+    }
 });
 
-// Error handling middleware and need more error handing
+
+
+// Update game state
+app.put('/api/game/update', authenticateToken, (req, res) => {
+    const { game_id, revealed_cells, flagged_cells } = req.body;
+
+    if (!game_id || !Array.isArray(revealed_cells) || !Array.isArray(flagged_cells)) {
+        return res.status(400).json({ error: 'Game ID, revealed cells, and flagged cells are required' });
+    }
+
+    db('game_states')
+        .where({ id: game_id, user_id: req.user.id })
+        .update({
+            revealed_cells: JSON.stringify(revealed_cells),
+            flagged_cells: JSON.stringify(flagged_cells),
+            updated_at: db.fn.now()
+        })
+        .then(changes => {
+            if (!changes || changes === 0) return res.status(404).json({ error: 'No active game found' });
+            res.json({ message: 'Game state updated successfully' });
+        })
+        .catch(err => {
+            console.error(err);
+            res.status(500).json({ error: 'Failed to update game state' });
+        });
+});
+
+// Get revealed cells
+app.get('/api/game/:gameId/revealed', authenticateToken, async (req, res) => {
+    const { gameId } = req.params;
+    const game = await db('game_states').where({ id: gameId, user_id: req.user.id }).first();
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    res.json({ revealed_cells: JSON.parse(game.revealed_cells) });
+});
+
+// Get flagged cells
+app.get('/api/game/:gameId/flagged', authenticateToken, async (req, res) => {
+    const { gameId } = req.params;
+    const game = await db('game_states').where({ id: gameId, user_id: req.user.id }).first();
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    res.json({ flagged_cells: JSON.parse(game.flagged_cells) });
+});
+
+
+
+// Finish game (transactional)
+app.post('/api/game/finish', authenticateToken, (req, res) => {
+    const { won, level, score } = req.body;
+
+    if (won === undefined || level === undefined || score === undefined) {
+        return res.status(400).json({ error: 'Won status, level, and score are required' });
+    }
+
+    db.transaction(trx => {
+        return trx('game_states')
+            .where({ user_id: req.user.id, game_status: 'playing' })
+            .first()
+            .then(game => {
+                if (!game) throw new Error('NO_ACTIVE_GAME');
+
+                // Mark the game finished
+                return trx('game_states')
+                    .where({ id: game.id })
+                    .update({
+                        game_status: won ? 'won' : 'lost',
+                        updated_at: db.fn.now()
+                    })
+                    .then(() => {
+                        if (!won) return { score_id: null }; // only record score if user won
+
+                        return trx('scores')
+                            .insert({
+                                user_id: req.user.id,
+                                score,        // 👈 use score from request body
+                                level,        // 👈 use level from request body
+                                created_at: db.fn.now()
+                            })
+                            .returning('id')
+                            .then(rows => ({ score_id: rows[0] }));
+                    });
+            });
+    })
+        .then(result => {
+            res.json({
+                message: 'Game finished successfully',
+                won,
+                score_id: result.score_id,
+                score,
+                level
+            });
+        })
+        .catch(err => {
+            if (err.message === 'NO_ACTIVE_GAME') {
+                return res.status(404).json({ error: 'No active game found' });
+            }
+            console.error(err);
+            res.status(500).json({ error: 'Server error' });
+        });
+});
+
+
+
+// User's scores
+app.get('/api/scores/user', authenticateToken, (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+    const offset = parseInt(req.query.offset || '0');
+
+    db('scores')
+        .select('id', 'mine_count', 'level_id', 'created_at')
+        .where({ user_id: req.user.id })
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .offset(offset)
+        .then(scores => res.json(scores))
+        .catch(err => res.status(500).json({ error: 'Server error' }));
+});
+
+app.get('/api/leaderboard', (req, res) => {
+    const { level_id } = req.query;
+    const limit = parseInt(req.query.limit || '10');
+
+    let q = db('scores as s')
+        .join('users as u', 's.user_id', 'u.id')
+        .select('u.username', 'u.country_flag', 's.mine_count', 's.level_id', 's.created_at');
+
+    if (level_id) q = q.where('s.level_id', level_id);
+
+    q.orderBy('s.created_at', 'desc').limit(limit)
+        .then(rows => res.json(rows))
+        .catch(err => res.status(500).json({ error: 'Server error' }));
+});
+
+app.get('/api/user/stats', authenticateToken, (req, res) => {
+    const userId = req.user.id;
+    db('scores')
+        .where({ user_id: userId })
+        .select('level', 'score', 'created_at')
+        .then(stats => {
+            res.json(stats); // returns an array of score objects
+        })
+        .catch(err => {
+            console.error(err);
+            res.status(500).json({ error: 'Server error' });
+        });
+});
+
+
+// Error handling middleware
 app.use((err, req, res, next) => {
-    console.error(err.stack);
+    console.error('Unhandled error:', err.stack || err);
     res.status(500).json({ error: 'Something went wrong!' });
 });
 
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({ error: 'Route not found' });
-});
-
-// Start server
-app.listen(PORT, () => {
-    console.log(`Mine Master API server running on port ${PORT}`);
-});
+// 404
+app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 
 // Graceful shutdown
 process.on('SIGINT', () => {
     console.log('\nShutting down gracefully...');
-    db.close((err) => {
-        if (err) {
-            console.error('Error closing database:', err.message);
-        } else {
-            console.log('Database connection closed.');
-        }
-        process.exit(0);
-    });
+    Promise.all([
+        db.destroy().catch(err => console.error('Error closing db', err)),
+        redis.quit().catch(err => console.error('Error closing redis', err))
+    ]).then(() => process.exit(0));
+});
+
+// Catch-all for undefined API routes
+app.use((req, res) => {
+    res.status(404).json({ error: "Route not found" });
+});
+
+// Global error handler (optional but recommended)
+app.use((err, req, res, next) => {
+    console.error("Unhandled error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 Mine Master API running at http://localhost:${PORT}`);
 });
