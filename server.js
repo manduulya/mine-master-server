@@ -315,7 +315,13 @@ app.post('/api/auth/login', (req, res) => {
 
     db('users').where({ username }).andWhere('oauth_provider', null).first()
         .then(user => {
-            if (!user || !user.password_hash) return res.status(401).json({ error: 'Invalid credentials' });
+            if (!user) {
+                return res.status(404).json({ error: 'Account not found' });
+            }
+
+            if (!user.password_hash) {
+                return res.status(401).json({ error: 'Invalid credentials' });
+            }
 
             return bcrypt.compare(password, user.password_hash).then(ok => {
                 if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
@@ -399,7 +405,7 @@ app.put('/api/user/profile', authenticateToken, (req, res) => {
 
 // Start new game
 app.post('/api/game/start', authenticateToken, (req, res) => {
-    const { mine_count, mine_positions, level_id } = req.body;
+    const { mine_count, mine_positions, level_id, hints, streak } = req.body;
 
     if (mine_count === undefined || !Array.isArray(mine_positions)) {
         return res.status(400).json({ error: 'Grid dimensions, mine count, and mine positions are required' });
@@ -419,6 +425,8 @@ app.post('/api/game/start', authenticateToken, (req, res) => {
                     mine_positions: JSON.stringify(mine_positions),
                     revealed_cells: JSON.stringify([]),
                     flagged_cells: JSON.stringify([]),
+                    hints: hints || 0,
+                    streak: streak || 0,
                     game_status: 'playing',
                     created_at: db.fn.now(),
                     updated_at: db.fn.now()
@@ -473,10 +481,6 @@ app.get('/api/game/current', authenticateToken, async (req, res) => {
         if (!game) {
             return res.status(404).json({ error: 'No active game found' });
         }
-        // Debug logging
-        console.log('Found game:', game);
-        console.log('level_id value:', game.level_id);
-        console.log('level_id type:', typeof game.level_id);
 
         res.json({
             game_id: game.id,
@@ -485,6 +489,8 @@ app.get('/api/game/current', authenticateToken, async (req, res) => {
             mine_positions: JSON.parse(game.mine_positions),
             revealed_cells: JSON.parse(game.revealed_cells),
             flagged_cells: JSON.parse(game.flagged_cells),
+            hints: game.hints,
+            streak: game.streak,
             game_status: game.game_status,
         });
     } catch (err) {
@@ -540,7 +546,8 @@ app.get('/api/game/:gameId/flagged', authenticateToken, async (req, res) => {
 
 // Finish game (transactional)
 app.post('/api/game/finish', authenticateToken, (req, res) => {
-    const { won, level, score } = req.body;
+    const { won, level, score, hints, streak } = req.body;
+    console.log("Finishing game with data:", req.body);
 
     if (won === undefined || level === undefined || score === undefined) {
         return res.status(400).json({ error: 'Won status, level, and score are required' });
@@ -553,21 +560,23 @@ app.post('/api/game/finish', authenticateToken, (req, res) => {
             .then(game => {
                 if (!game) throw new Error('NO_ACTIVE_GAME');
 
-                // Mark the game finished
+                // Update game_states with final hints and streak
                 return trx('game_states')
                     .where({ id: game.id })
                     .update({
                         game_status: won ? 'won' : 'lost',
+                        hints: hints || 0,
+                        streak: streak || 0,
                         updated_at: db.fn.now()
                     })
                     .then(() => {
-                        if (!won) return { score_id: null }; // only record score if user won
+                        if (!won) return { score_id: null };
 
                         return trx('scores')
                             .insert({
                                 user_id: req.user.id,
-                                score,        // 👈 use score from request body
-                                level,        // 👈 use level from request body
+                                score,
+                                level,
                                 created_at: db.fn.now()
                             })
                             .returning('id')
@@ -625,18 +634,38 @@ app.get('/api/leaderboard', (req, res) => {
         .catch(err => res.status(500).json({ error: 'Server error' }));
 });
 
-app.get('/api/user/stats', authenticateToken, (req, res) => {
-    const userId = req.user.id;
-    db('scores')
-        .where({ user_id: userId })
-        .select('level', 'score', 'created_at')
-        .then(stats => {
-            res.json(stats); // returns an array of score objects
-        })
-        .catch(err => {
-            console.error(err);
-            res.status(500).json({ error: 'Server error' });
+// Get user statistics
+app.get('/api/user/stats', authenticateToken, async (req, res) => {
+    try {
+        const gamesPlayed = await db('game_states')
+            .where({ user_id: req.user.id })
+            .whereIn('game_status', ['won', 'lost'])
+            .count('* as count')
+            .first();
+
+        const gamesWon = await db('game_states')
+            .where({ user_id: req.user.id, game_status: 'won' })
+            .count('* as count')
+            .first();
+
+        const totalScore = await db('scores')
+            .where({ user_id: req.user.id })
+            .sum('score as total')
+            .first();
+
+        const played = parseInt(gamesPlayed?.count || '0');
+        const won = parseInt(gamesWon?.count || '0');
+        const total = parseInt(totalScore?.total || '0');
+
+        res.json({
+            games_played: played,
+            games_won: won,
+            total_score: total,
         });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to load stats' });
+    }
 });
 
 

@@ -17,16 +17,19 @@ exports.up = function (knex) {
         table.text('revealed_cells').notNullable();
         table.text('flagged_cells').notNullable();
 
+        // Add hints and streak tracking
+        table.integer('hints').defaultTo(0);
+        table.integer('streak').defaultTo(0);
+
         table.string('game_status', 20).notNullable().defaultTo('playing');
         table.timestamps(true, true);
 
         // Indexes
-        table.index(['user_id']);                    // fast lookups per user
-        table.index(['user_id', 'game_status']);     // fast "active game" lookup
-        table.index(['level_id']);                   // optional, for level stats
+        table.index(['user_id']);
+        table.index(['user_id', 'game_status']);
+        table.index(['level_id']);
     });
 };
-
 
 /**
  * @param { import("knex").Knex } knex
