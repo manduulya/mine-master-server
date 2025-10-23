@@ -619,19 +619,46 @@ app.get('/api/scores/user', authenticateToken, (req, res) => {
         .catch(err => res.status(500).json({ error: 'Server error' }));
 });
 
-app.get('/api/leaderboard', (req, res) => {
-    const { level_id } = req.query;
-    const limit = parseInt(req.query.limit || '10');
+// Replace the existing /api/leaderboard endpoint in server.js with this:
 
-    let q = db('scores as s')
-        .join('users as u', 's.user_id', 'u.id')
-        .select('u.username', 'u.country_flag', 's.mine_count', 's.level_id', 's.created_at');
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const { level } = req.query; // Changed from level_id to match your schema
+        const limit = parseInt(req.query.limit || '50');
 
-    if (level_id) q = q.where('s.level_id', level_id);
+        // Build query to aggregate total scores per user
+        let query = db('scores as s')
+            .join('users as u', 's.user_id', 'u.id')
+            .select(
+                'u.username',
+                'u.country_flag',
+                db.raw('COALESCE(SUM(s.score), 0) as total_score'),
+                db.raw('COUNT(s.id) as games_played')
+            )
+            .groupBy('u.id', 'u.username', 'u.country_flag');
 
-    q.orderBy('s.created_at', 'desc').limit(limit)
-        .then(rows => res.json(rows))
-        .catch(err => res.status(500).json({ error: 'Server error' }));
+        // Optional: filter by level if provided
+        if (level) {
+            query = query.where('s.level', level);
+        }
+
+        const results = await query
+            .orderBy('total_score', 'desc')
+            .limit(limit);
+
+        // Return country_flag code directly - Flutter will handle mapping
+        const leaderboard = results.map(row => ({
+            username: row.username,
+            total_score: parseInt(row.total_score) || 0,
+            country_flag: row.country_flag || 'international',
+            games_played: parseInt(row.games_played) || 0
+        }));
+
+        res.json(leaderboard);
+    } catch (err) {
+        console.error('Leaderboard error:', err);
+        res.status(500).json({ error: 'Failed to load leaderboard' });
+    }
 });
 
 // Get user statistics
