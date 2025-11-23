@@ -243,12 +243,22 @@ const authenticateToken = (req, res, next) => {
 
 // Available country flags
 const AVAILABLE_FLAGS = [
-    'international', 'us', 'uk', 'ca', 'au', 'de', 'fr', 'it', 'es', 'jp',
-    'kr', 'cn', 'in', 'br', 'mx', 'ru', 'za', 'eg', 'ng', 'ar', 'cl', 'pe',
-    'se', 'no', 'dk', 'fi', 'nl', 'be', 'ch', 'at', 'pt', 'ie', 'pl', 'cz',
-    'hu', 'gr', 'tr', 'il', 'ae', 'sa', 'th', 'vn', 'id', 'my', 'sg', 'ph'
+    'international', 'af', 'al', 'dz', 'ad', 'ao', 'ag', 'ar', 'am', 'au', 'at', 'az',
+    'bs', 'bh', 'bd', 'bb', 'by', 'be', 'bz', 'bj', 'bt', 'bo', 'ba', 'bw', 'br', 'bn',
+    'bg', 'bf', 'bi', 'kh', 'cm', 'ca', 'cv', 'cf', 'td', 'cl', 'cn', 'co', 'km', 'cg',
+    'cr', 'hr', 'cu', 'cy', 'cz', 'dk', 'dj', 'dm', 'do', 'tl', 'ec', 'eg', 'sv', 'gq',
+    'er', 'ee', 'sz', 'et', 'fj', 'fi', 'fr', 'ga', 'gm', 'ge', 'de', 'gh', 'gr', 'gd',
+    'gt', 'gn', 'gw', 'gy', 'ht', 'hn', 'hu', 'is', 'in', 'id', 'ir', 'iq', 'ie', 'il',
+    'it', 'ci', 'jm', 'jp', 'jo', 'kz', 'ke', 'ki', 'kw', 'kg', 'la', 'lv', 'lb', 'ls',
+    'lr', 'ly', 'li', 'lt', 'lu', 'mg', 'mw', 'my', 'mv', 'ml', 'mt', 'mh', 'mr', 'mu',
+    'mx', 'fm', 'md', 'mc', 'mn', 'me', 'ma', 'mz', 'mm', 'na', 'nr', 'np', 'nl', 'nz',
+    'ni', 'ne', 'ng', 'kp', 'mk', 'no', 'om', 'pk', 'pw', 'ps', 'pa', 'pg', 'py', 'pe',
+    'ph', 'pl', 'pt', 'qa', 'ro', 'ru', 'rw', 'kn', 'lc', 'vc', 'ws', 'sm', 'st', 'sa',
+    'sn', 'rs', 'sc', 'sl', 'sg', 'sk', 'si', 'sb', 'so', 'za', 'kr', 'ss', 'es', 'lk',
+    'sd', 'sr', 'se', 'ch', 'sy', 'tw', 'tj', 'tz', 'th', 'tg', 'to', 'tt', 'tn', 'tr',
+    'tm', 'tv', 'ug', 'ua', 'ae', 'gb', 'us', 'uy', 'uz', 'vu', 'va', 've', 'vn', 'ye',
+    'zm', 'zw'
 ];
-
 // --- Routes ---
 
 // Health
@@ -388,19 +398,101 @@ app.get('/api/user/profile', authenticateToken, (req, res) => {
         }).catch(err => res.status(500).json({ error: 'Server error' }));
 });
 
-app.put('/api/user/profile', authenticateToken, (req, res) => {
-    const { country_flag } = req.body;
-    if (country_flag && !AVAILABLE_FLAGS.includes(country_flag)) return res.status(400).json({ error: 'Invalid country flag' });
+app.put('/api/user/profile', authenticateToken, async (req, res) => {
+    const { country_flag, username, current_password, new_password } = req.body;
+    console.log('📥 Profile update request:', {
+        user_id: req.user.id,
+        body: req.body
+    });
 
-    const updates = {};
-    if (country_flag !== undefined) updates.country_flag = country_flag;
-    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+    try {
+        const updates = {};
 
-    updates.updated_at = db.fn.now();
+        // Country flag update
+        if (country_flag !== undefined) {
+            if (!AVAILABLE_FLAGS.includes(country_flag)) {
+                return res.status(400).json({ error: 'Invalid country flag' });
+            }
+            updates.country_flag = country_flag;
+        }
 
-    db('users').where({ id: req.user.id }).update(updates)
-        .then(() => res.json({ message: 'Profile updated successfully' }))
-        .catch(err => res.status(500).json({ error: 'Failed to update profile' }));
+        // Username update
+        if (username !== undefined) {
+            if (!username || username.trim().length === 0) {
+                return res.status(400).json({ error: 'Username cannot be empty' });
+            }
+
+            // Check if username is already taken by another user
+            const existing = await db('users')
+                .where({ username: username.trim() })
+                .whereNot({ id: req.user.id })
+                .first();
+
+            if (existing) {
+                return res.status(409).json({ error: 'Username already taken' });
+            }
+            updates.username = username.trim();
+        }
+
+        // Password update (requires current password verification)
+        if (new_password !== undefined) {
+            if (!current_password) {
+                return res.status(400).json({ error: 'Current password required to change password' });
+            }
+
+            const user = await db('users').where({ id: req.user.id }).first();
+
+            // Check if user has OAuth login (no password set)
+            if (user.oauth_provider) {
+                return res.status(400).json({
+                    error: 'Cannot set password for OAuth accounts'
+                });
+            }
+
+            if (!user.password_hash) {
+                return res.status(400).json({
+                    error: 'No password set for this account'
+                });
+            }
+
+            // Verify current password
+            const validPassword = await bcrypt.compare(current_password, user.password_hash);
+            if (!validPassword) {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+
+            if (new_password.length < 6) {
+                return res.status(400).json({
+                    error: 'New password must be at least 6 characters'
+                });
+            }
+
+            updates.password_hash = await bcrypt.hash(new_password, 10);
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        updates.updated_at = db.fn.now();
+
+        await db('users').where({ id: req.user.id }).update(updates);
+
+        // Get updated user info to return
+        const updatedUser = await db('users')
+            .where({ id: req.user.id })
+            .select('id', 'username', 'email', 'country_flag')
+            .first();
+
+        res.json({
+            message: 'Profile updated successfully',
+            user: updatedUser,
+            updated_fields: Object.keys(updates).filter(key => key !== 'updated_at' && key !== 'password_hash')
+        });
+    } catch (err) {
+        console.error('Profile update error:', err);
+        res.status(500).json({ error: 'Failed to update profile' });
+    }
 });
 
 // Start new game
@@ -501,21 +593,26 @@ app.get('/api/game/current', authenticateToken, async (req, res) => {
 
 
 
-// Update game state
 app.put('/api/game/update', authenticateToken, (req, res) => {
-    const { game_id, revealed_cells, flagged_cells } = req.body;
+    const { game_id, revealed_cells, flagged_cells, hints } = req.body;
 
     if (!game_id || !Array.isArray(revealed_cells) || !Array.isArray(flagged_cells)) {
         return res.status(400).json({ error: 'Game ID, revealed cells, and flagged cells are required' });
     }
 
+    const updateData = {
+        revealed_cells: JSON.stringify(revealed_cells),
+        flagged_cells: JSON.stringify(flagged_cells),
+        updated_at: db.fn.now(),
+    };
+
+    if (typeof hints === 'number') {
+        updateData.hints = hints;
+    }
+
     db('game_states')
         .where({ id: game_id, user_id: req.user.id })
-        .update({
-            revealed_cells: JSON.stringify(revealed_cells),
-            flagged_cells: JSON.stringify(flagged_cells),
-            updated_at: db.fn.now()
-        })
+        .update(updateData)
         .then(changes => {
             if (!changes || changes === 0) return res.status(404).json({ error: 'No active game found' });
             res.json({ message: 'Game state updated successfully' });
@@ -525,6 +622,7 @@ app.put('/api/game/update', authenticateToken, (req, res) => {
             res.status(500).json({ error: 'Failed to update game state' });
         });
 });
+
 
 // Get revealed cells
 app.get('/api/game/:gameId/revealed', authenticateToken, async (req, res) => {
@@ -543,7 +641,6 @@ app.get('/api/game/:gameId/flagged', authenticateToken, async (req, res) => {
 });
 
 
-
 // Finish game (transactional)
 app.post('/api/game/finish', authenticateToken, (req, res) => {
     const { won, level, score, hints, streak } = req.body;
@@ -560,7 +657,7 @@ app.post('/api/game/finish', authenticateToken, (req, res) => {
             .then(game => {
                 if (!game) throw new Error('NO_ACTIVE_GAME');
 
-                // Update game_states with final hints and streak
+                // Update game_states
                 return trx('game_states')
                     .where({ id: game.id })
                     .update({
@@ -570,33 +667,81 @@ app.post('/api/game/finish', authenticateToken, (req, res) => {
                         updated_at: db.fn.now()
                     })
                     .then(() => {
-                        if (!won) return { score_id: null };
+                        if (!won) return { score_id: null, is_new_record: false };
 
+                        // Check if user has existing score
                         return trx('scores')
-                            .insert({
-                                user_id: req.user.id,
-                                score,
-                                level,
-                                created_at: db.fn.now()
-                            })
-                            .returning('id')
-                            .then(rows => ({ score_id: rows[0] }));
+                            .where({ user_id: req.user.id })
+                            .first()
+                            .then(existingScore => {
+                                if (!existingScore) {
+                                    // No existing score, insert new
+                                    return trx('scores')
+                                        .insert({
+                                            user_id: req.user.id,
+                                            score,
+                                            level,
+                                            created_at: db.fn.now(),
+                                            updated_at: db.fn.now()
+                                        })
+                                        .returning('id')
+                                        .then(rows => ({
+                                            score_id: rows[0]?.id || rows[0], // Handle different return formats
+                                            is_new_record: true
+                                        }));
+                                }
+
+                                // Always update with the new cumulative score and level
+                                return trx('scores')
+                                    .where({ user_id: req.user.id })
+                                    .update({
+                                        score,
+                                        level,
+                                        updated_at: db.fn.now()
+                                    })
+                                    .then(() => ({
+                                        score_id: existingScore.id,
+                                        is_new_record: score > existingScore.score
+                                    }));
+                            });
                     });
             });
     })
         .then(result => {
+            console.log('✅ Game finished successfully:', result);
             res.json({
                 message: 'Game finished successfully',
                 won,
                 score_id: result.score_id,
                 score,
-                level
+                level,
+                is_new_record: result.is_new_record
             });
         })
         .catch(err => {
+            console.error('❌ Error finishing game:', err);
             if (err.message === 'NO_ACTIVE_GAME') {
                 return res.status(404).json({ error: 'No active game found' });
             }
+            res.status(500).json({ error: 'Server error', details: err.message });
+        });
+});
+
+// Get user's current score
+app.get('/api/user/score', authenticateToken, (req, res) => {
+    db('scores')
+        .where({ user_id: req.user.id })
+        .first()
+        .then(score => {
+            if (!score) {
+                return res.json({ score: 0, level: 0 });
+            }
+            res.json({
+                score: score.score || 0,
+                level: score.level || 0
+            });
+        })
+        .catch(err => {
             console.error(err);
             res.status(500).json({ error: 'Server error' });
         });
@@ -619,7 +764,6 @@ app.get('/api/scores/user', authenticateToken, (req, res) => {
         .catch(err => res.status(500).json({ error: 'Server error' }));
 });
 
-// Replace the existing /api/leaderboard endpoint in server.js with this:
 
 app.get('/api/leaderboard', async (req, res) => {
     try {
