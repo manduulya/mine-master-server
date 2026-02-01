@@ -37,9 +37,6 @@ async function initRedis() {
 
 initRedis();
 
-
-
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'minemaster_secret_key_2024';
@@ -114,54 +111,54 @@ passport.deserializeUser((id, done) => {
         .catch(err => done(err));
 });
 
-// Passport strategies
-passport.use(new FacebookStrategy({
-    clientID: FACEBOOK_APP_ID,
-    clientSecret: FACEBOOK_APP_SECRET,
-    callbackURL: `${BASE_URL}/api/auth/facebook/callback`,
-    profileFields: ['id', 'emails', 'name', 'picture']
-}, (accessToken, refreshToken, profile, done) => {
-    try {
-        const facebookId = profile.id;
-        const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
-        const firstName = (profile.name && profile.name.givenName) || '';
-        const lastName = (profile.name && profile.name.familyName) || '';
-        const usernameBase = `${firstName}${lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '') || `facebook_user_${facebookId}`;
-        const profilePicture = profile.photos && profile.photos[0] ? profile.photos[0].value : null;
+// // Passport strategies
+// passport.use(new FacebookStrategy({
+//     clientID: FACEBOOK_APP_ID,
+//     clientSecret: FACEBOOK_APP_SECRET,
+//     callbackURL: `${BASE_URL}/api/auth/facebook/callback`,
+//     profileFields: ['id', 'emails', 'name', 'picture']
+// }, (accessToken, refreshToken, profile, done) => {
+//     try {
+//         const facebookId = profile.id;
+//         const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
+//         const firstName = (profile.name && profile.name.givenName) || '';
+//         const lastName = (profile.name && profile.name.familyName) || '';
+//         const usernameBase = `${firstName}${lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '') || `facebook_user_${facebookId}`;
+//         const profilePicture = profile.photos && profile.photos[0] ? profile.photos[0].value : null;
 
-        // Find user by oauth provider/id
-        db('users').where({ oauth_provider: 'facebook', oauth_id: facebookId }).first()
-            .then(existingUser => {
-                if (existingUser) return done(null, existingUser);
+//         // Find user by oauth provider/id
+//         db('users').where({ oauth_provider: 'facebook', oauth_id: facebookId }).first()
+//             .then(existingUser => {
+//                 if (existingUser) return done(null, existingUser);
 
-                // If email exists, link account
-                if (email) {
-                    return db('users').where({ email }).first()
-                        .then(emailUser => {
-                            if (emailUser) {
-                                return db('users').where({ id: emailUser.id }).update({
-                                    oauth_provider: 'facebook',
-                                    oauth_id: facebookId,
-                                    // profile_picture: profilePicture,
-                                    updated_at: db.fn.now()
-                                }).then(() => {
-                                    return db('users').where({ id: emailUser.id }).first().then(u => done(null, u));
-                                });
-                            }
+//                 // If email exists, link account
+//                 if (email) {
+//                     return db('users').where({ email }).first()
+//                         .then(emailUser => {
+//                             if (emailUser) {
+//                                 return db('users').where({ id: emailUser.id }).update({
+//                                     oauth_provider: 'facebook',
+//                                     oauth_id: facebookId,
+//                                     // profile_picture: profilePicture,
+//                                     updated_at: db.fn.now()
+//                                 }).then(() => {
+//                                     return db('users').where({ id: emailUser.id }).first().then(u => done(null, u));
+//                                 });
+//                             }
 
-                            // create new user with email
-                            return createOauthUser(usernameBase, email, 'facebook', facebookId, profilePicture, done);
-                        });
-                }
+//                             // create new user with email
+//                             return createOauthUser(usernameBase, email, 'facebook', facebookId, profilePicture, done);
+//                         });
+//                 }
 
-                // create new user without verified email
-                return createOauthUser(usernameBase, `${usernameBase}@facebook.local`, 'facebook', facebookId, profilePicture, done);
-            })
-            .catch(err => done(err));
-    } catch (err) {
-        done(err);
-    }
-}));
+//                 // create new user without verified email
+//                 return createOauthUser(usernameBase, `${usernameBase}@facebook.local`, 'facebook', facebookId, profilePicture, done);
+//             })
+//             .catch(err => done(err));
+//     } catch (err) {
+//         done(err);
+//     }
+// }));
 
 passport.use(new GoogleStrategy({
     clientID: GOOGLE_CLIENT_ID,
@@ -347,18 +344,234 @@ app.post('/api/auth/login', (req, res) => {
             res.status(500).json({ error: 'Server error' });
         });
 });
+// Reset Password with detailed logging
+app.post('/api/auth/reset-password', (req, res) => {
+    const { username, email, new_password } = req.body;
 
-// OAuth routes
-app.get('/api/auth/facebook', passport.authenticate('facebook', { scope: ['email'] }));
-app.get('/api/auth/facebook/callback',
-    passport.authenticate('facebook', { failureRedirect: '/login' }),
-    (req, res) => {
-        const token = jwt.sign({ id: req.user.id, username: req.user.username }, JWT_SECRET, { expiresIn: '24h' });
-        res.redirect(`myapp://auth/success?token=${token}&user=${encodeURIComponent(JSON.stringify({
-            id: req.user.id, username: req.user.username, email: req.user.email, country_flag: req.user.country_flag, auth_method: 'facebook'
-        }))}`);
+    console.log('=== PASSWORD RESET REQUEST ===');
+    console.log('Raw body:', req.body);
+    console.log('Username received:', username);
+    console.log('Email received:', email);
+    console.log('Password length:', new_password ? new_password.length : 0);
+
+    // Validation
+    if (!username || !email || !new_password) {
+        console.log('❌ Validation failed: Missing fields');
+        return res.status(400).json({ error: 'Username, email, and new password are required' });
     }
-);
+
+    if (new_password.length < 6) {
+        console.log('❌ Validation failed: Password too short');
+        return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    const trimmedUsername = username.trim();
+    const trimmedEmail = email.trim().toLowerCase();
+
+    console.log('After trimming:');
+    console.log('  Username:', `"${trimmedUsername}"`);
+    console.log('  Email:', `"${trimmedEmail}"`);
+
+    // Find user by username AND email (both must match for security)
+    db('users')
+        .where({ username: trimmedUsername, email: trimmedEmail })
+        .first()
+        .then(user => {
+            console.log('Database query result:', user ? 'User found' : 'No user found');
+
+            if (user) {
+                console.log('Found user:', {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email
+                });
+            } else {
+                console.log('❌ No matching user in database');
+                console.log('Searching for all users with this username:');
+
+                // Debug: Check if username exists at all
+                return db('users')
+                    .where({ username: trimmedUsername })
+                    .first()
+                    .then(userByUsername => {
+                        if (userByUsername) {
+                            console.log('Found user by username only:', {
+                                username: userByUsername.username,
+                                email: userByUsername.email
+                            });
+                            console.log('⚠️ Username exists but email does not match!');
+                            console.log(`  Provided email: "${trimmedEmail}"`);
+                            console.log(`  Actual email: "${userByUsername.email}"`);
+                        } else {
+                            console.log('❌ Username does not exist in database at all');
+                        }
+
+                        return res.status(404).json({
+                            error: 'No account found with this username and email'
+                        });
+                    });
+            }
+
+            // Hash the new password
+            return bcrypt.hash(new_password, 10).then(passwordHash => {
+                console.log('✅ Password hashed successfully');
+
+                // Update the password in the database
+                return db('users')
+                    .where({ id: user.id })
+                    .update({
+                        password_hash: passwordHash,
+                        updated_at: db.fn.now()
+                    })
+                    .then(() => {
+                        console.log('✅ Password updated successfully for user:', user.username);
+                        res.json({
+                            message: 'Password reset successfully',
+                            success: true
+                        });
+                    });
+            });
+        })
+        .catch(err => {
+            console.error('❌ Password reset error:', err);
+            res.status(500).json({ error: 'Failed to reset password' });
+        });
+});
+
+app.post('/api/auth/facebook', async (req, res) => {
+    console.log('\n=== FACEBOOK AUTH REQUEST START ===');
+    console.log('📩 Request received at:', new Date().toISOString());
+    console.log('📩 Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('📩 Body:', JSON.stringify(req.body, null, 2));
+
+    const { facebook_id, name, email } = req.body;
+
+    console.log('📝 Extracted values:');
+    console.log('  - Facebook ID:', facebook_id, '(type:', typeof facebook_id, ')');
+    console.log('  - Name:', name, '(type:', typeof name, ')');
+    console.log('  - Email:', email, '(type:', typeof email, ')');
+
+    // Validation
+    if (!facebook_id || !name) {
+        console.log('❌ Validation failed: Missing required fields');
+        return res.status(400).json({ error: 'Facebook ID and name are required' });
+    }
+
+    try {
+        console.log('🔍 Searching for existing Facebook user...');
+
+        const existingUser = await db('users')
+            .where({
+                oauth_provider: 'facebook',
+                oauth_id: facebook_id
+            })
+            .first();
+
+        console.log(
+            '📊 Database query result:',
+            existingUser ? 'User FOUND' : 'User NOT FOUND'
+        );
+
+        // --------------------------------------------------
+        // EXISTING USER
+        // --------------------------------------------------
+        if (existingUser) {
+            console.log('👤 Existing user details:', {
+                id: existingUser.id,
+                username: existingUser.username,
+                email: existingUser.email
+            });
+
+            await db('users')
+                .where({ id: existingUser.id })
+                .update({ updated_at: db.fn.now() });
+
+            console.log('🔑 Generating JWT token...');
+
+            const token = jwt.sign(
+                { id: existingUser.id, username: existingUser.username },
+                JWT_SECRET,
+                { expiresIn: '24h' }
+            );
+
+            const response = {
+                message: 'Login successful',
+                user: {
+                    id: existingUser.id,
+                    username: existingUser.username,
+                    email: existingUser.email,
+                    country_flag: existingUser.country_flag,
+                    auth_provider: 'facebook'
+                },
+                token
+            };
+
+            console.log('📤 Sending response:', JSON.stringify(response, null, 2));
+            console.log('=== FACEBOOK AUTH REQUEST END (SUCCESS) ===\n');
+
+            return res.json(response);
+        }
+
+        // --------------------------------------------------
+        // NEW USER
+        // --------------------------------------------------
+        console.log('🆕 New Facebook user — creating account...');
+
+        const baseUsername = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const username = `${baseUsername}${Math.floor(Math.random() * 10000)}`;
+
+        const newUser = {
+            username,
+            email: email || `${facebook_id}@facebook.temp`,
+            oauth_provider: 'facebook',
+            oauth_id: facebook_id,
+            country_flag: 'international',
+            created_at: db.fn.now(),
+            updated_at: db.fn.now()
+        };
+
+        console.log('💾 Inserting new user:', JSON.stringify(newUser, null, 2));
+
+        const [user] = await db('users')
+            .insert(newUser)
+            .returning(['id', 'username', 'email', 'country_flag']);
+
+        console.log('✅ New user created:', user);
+
+        const token = jwt.sign(
+            { id: user.id, username: user.username },
+            JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        const response = {
+            message: 'User created successfully via Facebook',
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                country_flag: user.country_flag,
+                auth_provider: 'facebook'
+            },
+            token
+        };
+
+        console.log('📤 Sending response (201):', JSON.stringify(response, null, 2));
+        console.log('=== FACEBOOK AUTH REQUEST END (NEW USER) ===\n');
+
+        res.status(201).json(response);
+
+    } catch (err) {
+        console.error('❌ FACEBOOK AUTH ERROR:', err);
+        console.log('=== FACEBOOK AUTH REQUEST END (ERROR) ===\n');
+
+        res.status(500).json({
+            error: 'Failed to authenticate with Facebook',
+            details: err.message
+        });
+    }
+});
+
 
 app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 app.get('/api/auth/google/callback',
