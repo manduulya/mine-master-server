@@ -458,119 +458,193 @@ app.post('/api/auth/facebook', async (req, res) => {
     }
 
     try {
-        console.log('🔍 Searching for existing Facebook user...');
-
-        const existingUser = await db('users')
-            .where({
-                oauth_provider: 'facebook',
-                oauth_id: facebook_id
-            })
+        // --------------------------------------------------
+        // 1) EXISTING USER BY OAUTH
+        // --------------------------------------------------
+        console.log('🔍 Searching for existing Facebook user by oauth...');
+        let user = await db('users')
+            .where({ oauth_provider: 'facebook', oauth_id: facebook_id })
             .first();
 
-        console.log(
-            '📊 Database query result:',
-            existingUser ? 'User FOUND' : 'User NOT FOUND'
-        );
+        console.log('📊 OAuth query result:', user ? 'User FOUND' : 'User NOT FOUND');
 
         // --------------------------------------------------
-        // EXISTING USER
+        // 2) IF NOT FOUND, TRY LINK BY EMAIL (IF PROVIDED)
+        //    (handles case where user signed up with email/password before)
         // --------------------------------------------------
-        if (existingUser) {
-            console.log('👤 Existing user details:', {
-                id: existingUser.id,
-                username: existingUser.username,
-                email: existingUser.email
-            });
+        if (!user && email) {
+            console.log('🔗 Trying to link existing account by email:', email);
 
-            await db('users')
-                .where({ id: existingUser.id })
-                .update({ updated_at: db.fn.now() });
+            const emailUser = await db('users').where({ email }).first();
 
-            console.log('🔑 Generating JWT token...');
+            if (emailUser) {
+                console.log('✅ Found existing user by email. Linking Facebook oauth to this user:', {
+                    id: emailUser.id,
+                    username: emailUser.username,
+                    email: emailUser.email,
+                });
 
-            const token = jwt.sign(
-                { id: existingUser.id, username: existingUser.username },
-                JWT_SECRET,
-                { expiresIn: '24h' }
-            );
+                await db('users')
+                    .where({ id: emailUser.id })
+                    .update({
+                        oauth_provider: 'facebook',
+                        oauth_id: facebook_id,
+                        updated_at: db.fn.now(),
+                    });
 
-            const response = {
-                message: 'Login successful',
-                user: {
-                    id: existingUser.id,
-                    username: existingUser.username,
-                    email: existingUser.email,
-                    country_flag: existingUser.country_flag,
-                    auth_provider: 'facebook'
-                },
-                token
-            };
-
-            console.log('📤 Sending response:', JSON.stringify(response, null, 2));
-            console.log('=== FACEBOOK AUTH REQUEST END (SUCCESS) ===\n');
-
-            return res.json(response);
+                user = await db('users')
+                    .select('id', 'username', 'email', 'country_flag')
+                    .where({ id: emailUser.id })
+                    .first();
+            } else {
+                console.log('ℹ️ No existing user found by email to link.');
+            }
         }
 
         // --------------------------------------------------
-        // NEW USER
+        // 3) IF STILL NOT FOUND, CREATE NEW USER
         // --------------------------------------------------
-        console.log('🆕 New Facebook user — creating account...');
+        if (!user) {
+            console.log('🆕 New Facebook user — creating account...');
 
-        const baseUsername = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const username = `${baseUsername}${Math.floor(Math.random() * 10000)}`;
+            const baseUsername = String(name).toLowerCase().replace(/[^a-z0-9]/g, '') || 'user';
 
-        const newUser = {
-            username,
-            email: email || `${facebook_id}@facebook.temp`,
-            oauth_provider: 'facebook',
-            oauth_id: facebook_id,
-            country_flag: 'international',
-            created_at: db.fn.now(),
-            updated_at: db.fn.now()
-        };
+            // Try a few times to avoid username collisions
+            let createdUser = null;
 
-        console.log('💾 Inserting new user:', JSON.stringify(newUser, null, 2));
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                const username = `${baseUsername}${Math.floor(Math.random() * 100000)}`;
 
-        const [user] = await db('users')
-            .insert(newUser)
-            .returning(['id', 'username', 'email', 'country_flag']);
+                const newUser = {
+                    username,
+                    email: email || `${facebook_id}@facebook.temp`,
+                    oauth_provider: 'facebook',
+                    oauth_id: facebook_id,
+                    country_flag: 'international',
+                    created_at: db.fn.now(),
+                    updated_at: db.fn.now(),
+                };
 
-        console.log('✅ New user created:', user);
+                // IMPORTANT: do NOT JSON.stringify(newUser) because db.fn.now() is not JSON-serializable
+                console.log('💾 Inserting new user:', {
+                    ...newUser,
+                    created_at: 'now()',
+                    updated_at: 'now()',
+                });
 
-        const token = jwt.sign(
-            { id: user.id, username: user.username },
-            JWT_SECRET,
-            { expiresIn: '24h' }
-        );
+                try {
+                    const inserted = await db('users').insert(newUser);
+
+                    // Works across DBs: inserted id may be number or [number]
+                    const insertedId = Array.isArray(inserted) ? inserted[0] : inserted;
+
+                    createdUser = await db('users')
+                        .select('id', 'username', 'email', 'country_flag')
+                        .where({ id: insertedId })
+                        .first();
+
+                    if (createdUser) break;
+                } catch (e) {
+                    // If username/email collision, retry; otherwise throw
+                    const msg = (e && e.message) ? e.message : String(e);
+
+                    const isUniqueViolation =
+                        msg.toLowerCase().includes('unique') ||
+                        msg.toLowerCase().includes('duplicate') ||
+                        msg.toLowerCase().includes('constraint');
+
+                    console.error(`❌ Insert attempt ${attempt} failed:`, msg);
+
+                    // If email is already taken (and we couldn't link), surface a clean error
+                    if (email && msg.toLowerCase().includes('email')) {
+                        return res.status(409).json({
+                            error:
+                                'An account with this email already exists. Please login with your existing method, then link Facebook, or contact support.',
+                        });
+                    }
+
+                    if (!isUniqueViolation || attempt === 5) throw e;
+                }
+            }
+
+            if (!createdUser) {
+                throw new Error('Failed to create user after multiple attempts');
+            }
+
+            user = createdUser;
+
+            console.log('✅ New user created:', user);
+
+            const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
+                expiresIn: '24h',
+            });
+
+            const response = {
+                message: 'User created successfully via Facebook',
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    country_flag: user.country_flag,
+                    auth_provider: 'facebook',
+                },
+                token,
+            };
+
+            console.log('📤 Sending response (201):', JSON.stringify(response, null, 2));
+            console.log('=== FACEBOOK AUTH REQUEST END (NEW USER) ===\n');
+
+            return res.status(201).json(response);
+        }
+
+        // --------------------------------------------------
+        // 4) EXISTING (OR LINKED) USER LOGIN
+        // --------------------------------------------------
+        console.log('👤 Existing/Linked user details:', {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+        });
+
+        await db('users').where({ id: user.id }).update({ updated_at: db.fn.now() });
+
+        console.log('🔑 Generating JWT token...');
+
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
+            expiresIn: '24h',
+        });
 
         const response = {
-            message: 'User created successfully via Facebook',
+            message: 'Login successful',
             user: {
                 id: user.id,
                 username: user.username,
                 email: user.email,
                 country_flag: user.country_flag,
-                auth_provider: 'facebook'
+                auth_provider: 'facebook',
             },
-            token
+            token,
         };
 
-        console.log('📤 Sending response (201):', JSON.stringify(response, null, 2));
-        console.log('=== FACEBOOK AUTH REQUEST END (NEW USER) ===\n');
+        console.log('📤 Sending response:', JSON.stringify(response, null, 2));
+        console.log('=== FACEBOOK AUTH REQUEST END (SUCCESS) ===\n');
 
-        res.status(201).json(response);
-
+        return res.json(response);
     } catch (err) {
-        console.error('❌ FACEBOOK AUTH ERROR:', err);
+        // Safer logging (avoid circular JSON problems)
+        console.error('❌ FACEBOOK AUTH ERROR:', {
+            message: err?.message,
+            stack: err?.stack,
+        });
         console.log('=== FACEBOOK AUTH REQUEST END (ERROR) ===\n');
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Failed to authenticate with Facebook',
-            details: err.message
+            details: err?.message || 'Unknown error',
         });
     }
 });
+
 
 
 app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
