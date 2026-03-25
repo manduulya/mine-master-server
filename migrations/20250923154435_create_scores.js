@@ -11,6 +11,7 @@ exports.up = function (knex) {
         table.integer('score').notNullable();
         table.integer('level').notNullable();
         table.timestamp('created_at').defaultTo(knex.fn.now());
+        table.timestamp('updated_at').defaultTo(knex.fn.now());
 
         // Indexes for leaderboard queries
         table.index(['level']); // Perfect for level leaderboards
