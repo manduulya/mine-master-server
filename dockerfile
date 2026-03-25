@@ -8,8 +8,8 @@ WORKDIR /usr/src/app
 # Copy package files
 COPY package*.json ./
 
-# Clean install - this will rebuild bcrypt for the container's architecture
-RUN npm ci --omit=dev
+# Install dependencies and rebuild native modules for container architecture
+RUN npm install --omit=dev
 
 # Copy source code
 COPY . .
