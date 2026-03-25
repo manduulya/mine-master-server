@@ -88,9 +88,9 @@ router.put('/user/profile', authenticateToken, async (req, res) => {
                 return res.status(400).json({ error: 'Username cannot be empty' });
             }
 
-            // Check if username is already taken by another user
+            // Check if username is already taken by another user (case-insensitive)
             const existing = await db('users')
-                .where({ username: username.trim() })
+                .whereRaw('LOWER(username) = ?', [username.trim().toLowerCase()])
                 .whereNot({ id: req.user.id })
                 .first();
 

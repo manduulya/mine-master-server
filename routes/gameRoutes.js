@@ -7,6 +7,38 @@ const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
 
+const HINT_REFILL_AMOUNT = 3;
+const HINT_REFILL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Sets/clears hints_zero_at on the user when hints change
+async function trackHintsZeroAt(db, userId, hints) {
+    if (hints === 0) {
+        // Only set it if not already set (preserve the original zero time)
+        const user = await db('users').where({ id: userId }).select('hints_zero_at').first();
+        if (!user.hints_zero_at) {
+            await db('users').where({ id: userId }).update({ hints_zero_at: new Date() });
+        }
+    } else {
+        await db('users').where({ id: userId }).update({ hints_zero_at: null });
+    }
+}
+
+// Checks if 24h have passed since hints went to 0, and refills to 3 if so
+async function maybeRefillHints(db, game, userId) {
+    if (game.hints !== 0) return game;
+
+    const user = await db('users').where({ id: userId }).select('hints_zero_at').first();
+    if (!user.hints_zero_at) return game;
+
+    const elapsed = Date.now() - new Date(user.hints_zero_at).getTime();
+    if (elapsed < HINT_REFILL_MS) return game;
+
+    await db('game_states').where({ id: game.id }).update({ hints: HINT_REFILL_AMOUNT });
+    await db('users').where({ id: userId }).update({ hints_zero_at: null });
+
+    return { ...game, hints: HINT_REFILL_AMOUNT };
+}
+
 router.post('/game/start', authenticateToken, (req, res) => {
 
     const { mine_count, mine_positions, level_id, hints, streak } = req.body;
@@ -56,27 +88,29 @@ router.post('/game/start', authenticateToken, (req, res) => {
         });
 });
 
-router.get('/game/active', authenticateToken, (req, res) => {
-    db('game_states')
-        .where({ user_id: req.user.id, game_status: 'playing' })
-        .first()
-        .then(game => {
-            if (!game) return res.status(404).json({ error: 'No active game' });
+router.get('/game/active', authenticateToken, async (req, res) => {
+    try {
+        let game = await db('game_states')
+            .where({ user_id: req.user.id, game_status: 'playing' })
+            .first();
+        if (!game) return res.status(404).json({ error: 'No active game' });
 
-            // Parse JSON fields before sending
-            game.mine_positions = JSON.parse(game.mine_positions);
-            game.revealed_cells = JSON.parse(game.revealed_cells);
-            game.flagged_cells = JSON.parse(game.flagged_cells);
+        game = await maybeRefillHints(db, game, req.user.id);
 
-            res.json(game);
-        })
-        .catch(err => res.status(500).json({ error: 'Failed to fetch active game' }));
+        game.mine_positions = JSON.parse(game.mine_positions);
+        game.revealed_cells = JSON.parse(game.revealed_cells);
+        game.flagged_cells = JSON.parse(game.flagged_cells);
+
+        res.json(game);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch active game' });
+    }
 });
 
 router.get('/game/current', authenticateToken, async (req, res) => {
 
     try {
-        const game = await db('game_states')
+        let game = await db('game_states')
             .where({ user_id: req.user.id })
             .orderBy('updated_at', 'desc')
             .first();
@@ -84,6 +118,8 @@ router.get('/game/current', authenticateToken, async (req, res) => {
         if (!game) {
             return res.status(404).json({ error: 'No active game found' });
         }
+
+        game = await maybeRefillHints(db, game, req.user.id);
 
         res.json({
             game_id: game.id,
@@ -123,8 +159,11 @@ router.put('/game/update', authenticateToken, (req, res) => {
     db('game_states')
         .where({ id: game_id, user_id: req.user.id })
         .update(updateData)
-        .then(changes => {
+        .then(async changes => {
             if (!changes || changes === 0) return res.status(404).json({ error: 'No active game found' });
+            if (typeof hints === 'number') {
+                await trackHintsZeroAt(db, req.user.id, hints);
+            }
             res.json({ message: 'Game state updated successfully' });
         })
         .catch(err => {
@@ -214,8 +253,11 @@ router.post('/game/finish', authenticateToken, (req, res) => {
                     });
             });
     })
-        .then(result => {
+        .then(async result => {
             console.log('✅ Game finished successfully:', result);
+            if (typeof hints === 'number') {
+                await trackHintsZeroAt(db, req.user.id, hints);
+            }
             res.json({
                 message: 'Game finished successfully',
                 won,
