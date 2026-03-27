@@ -1,5 +1,6 @@
 // routes/userRoutes.js
 const express = require('express');
+const bcrypt = require('bcrypt');
 const { knex: db } = require('../db');
 const { authenticateToken } = require('../middleware/auth');
 const { AVAILABLE_FLAGS } = require('../config/constants');
@@ -167,6 +168,19 @@ router.get('/user/profile', authenticateToken, async (req, res) => {
             if (!user) return res.status(404).json({ error: 'User not found' });
             res.json({ ...user, auth_method: user.oauth_provider || 'traditional' });
         }).catch(err => res.status(500).json({ error: 'Server error' }));
+});
+
+router.delete('/user/profile', authenticateToken, async (req, res) => {
+    try {
+        const deleted = await db('users').where({ id: req.user.id }).delete();
+        if (!deleted) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.json({ message: 'Account deleted successfully' });
+    } catch (err) {
+        console.error('Account deletion error:', err);
+        res.status(500).json({ error: 'Failed to delete account' });
+    }
 });
 
 module.exports = router;
