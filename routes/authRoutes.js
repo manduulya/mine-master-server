@@ -373,6 +373,155 @@ router.post('/facebook', async (req, res) => {
 });
 
 
+// /api/auth/apple
+router.post('/apple', async (req, res) => {
+    const { apple_id, name, email, identity_token } = req.body;
+
+    if (!apple_id || !identity_token) {
+        return res.status(400).json({ error: 'apple_id and identity_token are required' });
+    }
+
+    try {
+        // --------------------------------------------------
+        // 1) EXISTING USER BY OAUTH
+        // --------------------------------------------------
+        let user = await db('users')
+            .where({ oauth_provider: 'apple', oauth_id: apple_id })
+            .first();
+
+        // --------------------------------------------------
+        // 2) IF NOT FOUND, TRY LINK BY EMAIL (FIRST SIGN-IN ONLY)
+        // --------------------------------------------------
+        if (!user && email) {
+            const emailUser = await db('users').where({ email }).first();
+
+            if (emailUser) {
+                await db('users')
+                    .where({ id: emailUser.id })
+                    .update({
+                        oauth_provider: 'apple',
+                        oauth_id: apple_id,
+                        updated_at: db.fn.now(),
+                    });
+
+                user = await db('users')
+                    .select('id', 'username', 'email', 'country_flag')
+                    .where({ id: emailUser.id })
+                    .first();
+            }
+        }
+
+        // --------------------------------------------------
+        // 3) IF STILL NOT FOUND, CREATE NEW USER
+        //    name and email are only sent by Apple on first sign-in
+        // --------------------------------------------------
+        if (!user) {
+            const firstName = String(name || '')
+                .trim()
+                .toLowerCase()
+                .split(/\s+/)[0] || 'user';
+
+            const baseUsername = firstName
+                .replace(/[^a-z0-9]/g, '') || 'user';
+
+            let createdUser = null;
+
+            for (let attempt = 0; attempt < 5; attempt++) {
+                const username = attempt === 0
+                    ? baseUsername
+                    : `${baseUsername}${Math.floor(1000 + Math.random() * 9000)}`;
+
+                const newUser = {
+                    username,
+                    email: email || `${apple_id}@apple.temp`,
+                    oauth_provider: 'apple',
+                    oauth_id: apple_id,
+                    country_flag: 'international',
+                    created_at: db.fn.now(),
+                    updated_at: db.fn.now(),
+                };
+
+                try {
+                    const rows = await db('users').insert(newUser).returning('id');
+                    const insertedId =
+                        Array.isArray(rows) && rows.length
+                            ? (typeof rows[0] === 'object' ? rows[0].id : rows[0])
+                            : null;
+
+                    createdUser = await db('users')
+                        .select('id', 'username', 'email', 'country_flag')
+                        .where({ id: insertedId })
+                        .first();
+
+                    if (createdUser) break;
+                } catch (e) {
+                    const msg = (e && e.message) ? e.message : String(e);
+                    const isUniqueViolation =
+                        msg.toLowerCase().includes('unique') ||
+                        msg.toLowerCase().includes('duplicate') ||
+                        msg.toLowerCase().includes('constraint');
+
+                    if (!isUniqueViolation || attempt === 4) throw e;
+                }
+            }
+
+            if (!createdUser) {
+                throw new Error('Failed to create user after multiple attempts');
+            }
+
+            user = createdUser;
+
+            const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
+                expiresIn: '24h',
+            });
+
+            return res.status(201).json({
+                message: 'User created successfully via Apple',
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    country_flag: user.country_flag,
+                    auth_provider: 'apple',
+                },
+                token,
+            });
+        }
+
+        // --------------------------------------------------
+        // 4) EXISTING (OR LINKED) USER LOGIN
+        // --------------------------------------------------
+        await db('users').where({ id: user.id }).update({ updated_at: db.fn.now() });
+
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
+            expiresIn: '24h',
+        });
+
+        return res.json({
+            message: 'Login successful',
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                country_flag: user.country_flag,
+                auth_provider: 'apple',
+            },
+            token,
+        });
+    } catch (err) {
+        console.error('APPLE AUTH ERROR:', {
+            message: err?.message,
+            stack: err?.stack,
+        });
+
+        return res.status(500).json({
+            error: 'Failed to authenticate with Apple',
+            details: err?.message || 'Unknown error',
+        });
+    }
+});
+
+
 router.get('/oauth/status/:provider', (req, res) => {
 
     const { provider } = req.params;
