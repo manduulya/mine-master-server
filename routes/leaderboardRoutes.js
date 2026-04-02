@@ -29,9 +29,9 @@ router.get('/leaderboard', async (req, res) => {
 
         const leaderboard = results.map(row => ({
             username: row.username,
-            score: row.score,
+            score: row.score ?? 0,
             country_flag: row.country_flag || 'international',
-            level: row.level,
+            level: row.level ?? 0,
         }));
 
         res.json(leaderboard);
