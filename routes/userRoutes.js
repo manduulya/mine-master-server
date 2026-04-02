@@ -10,7 +10,6 @@ const { AVAILABLE_FLAGS } = require('../config/constants');
 const router = express.Router();
 
 router.get('/user/stats', authenticateToken, async (req, res) => {
-
     try {
         const gamesPlayed = await db('game_states')
             .where({ user_id: req.user.id })
@@ -28,6 +27,14 @@ router.get('/user/stats', authenticateToken, async (req, res) => {
             .sum('score as total')
             .first();
 
+        // Get hints and streak from the most recent finished game
+        const lastGame = await db('game_states')
+            .where({ user_id: req.user.id })
+            .whereIn('game_status', ['won', 'lost'])
+            .orderBy('updated_at', 'desc')
+            .select('hints', 'streak')
+            .first();
+
         const played = parseInt(gamesPlayed?.count || '0');
         const won = parseInt(gamesWon?.count || '0');
         const total = parseInt(totalScore?.total || '0');
@@ -36,12 +43,15 @@ router.get('/user/stats', authenticateToken, async (req, res) => {
             games_played: played,
             games_won: won,
             total_score: total,
+            hints: lastGame?.hints ?? 3,
+            streak: lastGame?.streak || 0,
         });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Failed to load stats' });
     }
 });
+
 
 
 

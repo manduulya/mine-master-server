@@ -15,26 +15,23 @@ router.get('/leaderboard', async (req, res) => {
             .select(
                 'u.username',
                 'u.country_flag',
-                db.raw('COALESCE(SUM(s.score), 0) as total_score'),
-                db.raw('COUNT(s.id) as games_played')
-            )
-            .groupBy('u.id', 'u.username', 'u.country_flag');
+                's.level',
+                's.score',
+            );
 
-        // Optional: filter by level if provided
         if (level) {
             query = query.where('s.level', level);
         }
 
         const results = await query
-            .orderBy('total_score', 'desc')
+            .orderBy('s.score', 'desc')
             .limit(limit);
 
-        // Return country_flag code directly - Flutter will handle mapping
         const leaderboard = results.map(row => ({
             username: row.username,
-            total_score: parseInt(row.total_score) || 0,
+            score: row.score,
             country_flag: row.country_flag || 'international',
-            games_played: parseInt(row.games_played) || 0
+            level: row.level,
         }));
 
         res.json(leaderboard);
