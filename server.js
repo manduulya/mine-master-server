@@ -18,6 +18,7 @@ const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const gameRoutes = require('./routes/gameRoutes');
 const leaderboardRoutes = require('./routes/leaderboardRoutes');
+const worldMapRoutes = require('./routes/worldMapRoutes');
 
 const app = express();
 
@@ -44,6 +45,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api', authenticateToken, userRoutes);
 app.use('/api', authenticateToken, gameRoutes);
 app.use('/api', leaderboardRoutes); // leaderboard might be public; keep as-is
+app.use('/api', worldMapRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
