@@ -31,7 +31,7 @@ router.post('/register', async (req, res) => {
         }).returning(['id', 'username', 'email']);
     }).then(rows => {
         const user = rows[0];
-        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '90d' });
         res.status(201).json({
             message: 'User created successfully',
             user: { id: user.id, username: user.username, email: user.email, country_flag, auth_method: 'traditional' },
@@ -64,7 +64,7 @@ router.post('/login', async (req, res) => {
 
             return bcrypt.compare(password, user.password_hash).then(ok => {
                 if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-                const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
+                const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '90d' });
                 res.json({
                     message: 'Login successful',
                     user: { id: user.id, username: user.username, email: user.email, country_flag: user.country_flag, auth_method: 'traditional' },
@@ -303,7 +303,7 @@ router.post('/facebook', async (req, res) => {
             console.log('✅ New user created:', user);
 
             const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
-                expiresIn: '24h',
+                expiresIn: '90d',
             });
 
             const response = {
@@ -338,7 +338,7 @@ router.post('/facebook', async (req, res) => {
         console.log('🔑 Generating JWT token...');
 
         const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
-            expiresIn: '24h',
+            expiresIn: '90d',
         });
 
         const response = {
@@ -472,7 +472,7 @@ router.post('/apple', async (req, res) => {
             user = createdUser;
 
             const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
-                expiresIn: '24h',
+                expiresIn: '90d',
             });
 
             return res.status(201).json({
@@ -494,7 +494,7 @@ router.post('/apple', async (req, res) => {
         await db('users').where({ id: user.id }).update({ updated_at: db.fn.now() });
 
         const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
-            expiresIn: '24h',
+            expiresIn: '90d',
         });
 
         return res.json({
@@ -531,7 +531,7 @@ router.get('/oauth/status/:provider', (req, res) => {
     db('users').where({ oauth_provider: provider, oauth_id }).first()
         .then(user => {
             if (!user) return res.status(404).json({ error: 'User not found' });
-            const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
+            const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '90d' });
             res.json({
                 message: 'OAuth login successful',
                 user: { id: user.id, username: user.username, email: user.email, country_flag: user.country_flag, auth_method: provider },
